@@ -1,6 +1,6 @@
 /**
  * =============================================================================
- *  main.cpp  —  Math-to-Assembly Toy Compiler Front-End
+ *  main.cpp  —  Math-to-Assembly Toy Compiler Front-End  (Interactive REPL)
  * =============================================================================
  *
  *  Three-stage pipeline:
@@ -54,7 +54,8 @@
  *  Build command:
  *    g++ -std=c++17 -Wall -Wextra -O2 -o compiler main.cpp
  *
- *  Standard: C++17  (uses string_view, make_unique, structured bindings, if-init)
+ *  Standard  : C++17  (string_view, make_unique, if-init, structured bindings)
+ *  Target ISA: ARM Cortex-M / PIC pseudo-assembly
  * =============================================================================
  */
 
@@ -68,16 +69,16 @@
 #include <string_view>
 #include <vector>
 
-// ─────────────────────────────────────────────────────────────────────────────
+// =============================================================================
 //  §1  TOKENS
 //      The atomic output of the lexer and the raw input of the parser.
-// ─────────────────────────────────────────────────────────────────────────────
+// =============================================================================
 
 /**
  * TokenKind — every syntactic category our language can produce.
  *
- * Stored as uint8_t so that sizeof(Token) stays small, which improves cache
- * utilisation when the parser iterates over the token vector repeatedly.
+ * Stored as uint8_t so that sizeof(Token) stays small, improving cache
+ * utilisation when the parser iterates over the token vector.
  */
 enum class TokenKind : uint8_t {
     // ── Literals and names ──────────────────────────
@@ -113,16 +114,16 @@ constexpr std::string_view kindLabel(TokenKind k) noexcept {
         case TokenKind::RParen:  return ")";
         case TokenKind::End:     return "<EOF>";
     }
-    return "?"; // satisfies -Wreturn-type; this branch is unreachable
+    return "?"; // satisfies -Wreturn-type; unreachable
 }
 
 /**
  * Token — a (kind, lexeme, optional-value) triple.
  *
- *  lexeme  — std::string_view that points DIRECTLY into the original source
- *            buffer.  Zero allocation; zero copying.  Valid as long as the
- *            source string remains alive (it does throughout the compile call).
- *  intVal  — the pre-parsed integer; meaningful only when kind == Number.
+ *  lexeme  — std::string_view pointing DIRECTLY into the original source buffer.
+ *            Zero allocation; zero copying.  Valid as long as the source string
+ *            remains alive (it does throughout each compile() call).
+ *  intVal  — pre-parsed integer value; meaningful only when kind == Number.
  */
 struct Token {
     TokenKind        kind;
@@ -130,11 +131,11 @@ struct Token {
     int64_t          intVal{0};
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
+// =============================================================================
 //  §2  LEXER
 //      Converts a raw source string_view into a flat std::vector<Token>.
-//      Complexity: O(n) time, O(k) space  (k = number of tokens ≤ n).
-// ─────────────────────────────────────────────────────────────────────────────
+//      Complexity: O(n) time, O(k) space  (k = number of tokens <= n).
+// =============================================================================
 
 /**
  * Lexer — single-pass, allocation-free tokeniser.
@@ -180,8 +181,6 @@ public:
 private:
     std::string_view src_;
     std::size_t      pos_;
-
-    // ── Internal scan helpers ─────────────────────────────────────────────
 
     void skipWhitespace() noexcept {
         while (pos_ < src_.size() &&
@@ -233,9 +232,9 @@ private:
     }
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
+// =============================================================================
 //  §3  ABSTRACT SYNTAX TREE (AST)
-// ─────────────────────────────────────────────────────────────────────────────
+// =============================================================================
 
 // ── 3a. Node kind tag ────────────────────────────────────────────────────────
 
@@ -263,13 +262,13 @@ using NodePtr = std::unique_ptr<struct ASTNode>;
 /**
  * ASTNode — polymorphic base for every node in the syntax tree.
  *
- * Memory ownership convention (RAII via unique_ptr):
+ * Memory ownership (RAII via unique_ptr):
  *   Every parent node owns its children through std::unique_ptr<ASTNode>.
  *   When the root goes out of scope, the entire tree is recursively destroyed
  *   in O(n) destructor calls — zero manual `delete`, zero memory leaks.
  *
- * Non-copyable: tree nodes are uniquely owned; copying would silently share
- * ownership, so we explicitly delete the copy constructor and assignment.
+ * Non-copyable: tree nodes are uniquely owned; copy constructor and assignment
+ * are explicitly deleted to prevent accidental shared ownership.
  */
 struct ASTNode {
     const NodeKind kind;
@@ -285,7 +284,6 @@ struct ASTNode {
     [[nodiscard]] virtual std::string dump(int depth) const = 0;
 
 protected:
-    /// Convenience: produce `depth * 2` spaces.
     static std::string pad(int depth) { return std::string(depth * 2, ' '); }
 };
 
@@ -294,9 +292,7 @@ protected:
 /// Leaf: an integer constant  e.g. 42
 struct NumberNode final : ASTNode {
     int64_t value;
-
     explicit NumberNode(int64_t v) : ASTNode(NodeKind::Number), value(v) {}
-
     [[nodiscard]] std::string dump(int depth) const override {
         return pad(depth) + "NumberLiteral(" + std::to_string(value) + ')';
     }
@@ -304,11 +300,9 @@ struct NumberNode final : ASTNode {
 
 /// Leaf: a variable reference  e.g. x, result
 struct VariableNode final : ASTNode {
-    std::string name; // owning std::string — safe if the source string goes away
-
+    std::string name; // owning std::string — safe after source string goes away
     explicit VariableNode(std::string_view n)
         : ASTNode(NodeKind::Variable), name(n) {}
-
     [[nodiscard]] std::string dump(int depth) const override {
         return pad(depth) + "VarRef(" + name + ')';
     }
@@ -319,7 +313,6 @@ struct VariableNode final : ASTNode {
  * `op` is one of '+', '-', '*', '/'.
  *
  * Tree shape for  a + b:
- *
  *     BinaryOp('+')
  *     ├── lhs  (sub-expression a)
  *     └── rhs  (sub-expression b)
@@ -328,11 +321,9 @@ struct BinaryOpNode final : ASTNode {
     char    op;
     NodePtr lhs;
     NodePtr rhs;
-
     BinaryOpNode(char op, NodePtr l, NodePtr r)
         : ASTNode(NodeKind::BinaryOp),
           op(op), lhs(std::move(l)), rhs(std::move(r)) {}
-
     [[nodiscard]] std::string dump(int depth) const override {
         return pad(depth) + std::string("BinaryOp('") + op + "')\n" +
                lhs->dump(depth + 1) + '\n' +
@@ -342,17 +333,14 @@ struct BinaryOpNode final : ASTNode {
 
 /**
  * Interior: a variable assignment statement  IDENT = expr.
- *
  *     Assign(x)
  *     └── rhs  (expression whose result will be stored in x)
  */
 struct AssignNode final : ASTNode {
     std::string name;
     NodePtr     rhs;
-
     AssignNode(std::string_view n, NodePtr r)
         : ASTNode(NodeKind::Assign), name(n), rhs(std::move(r)) {}
-
     [[nodiscard]] std::string dump(int depth) const override {
         return pad(depth) + "Assign(" + name + ")\n" +
                rhs->dump(depth + 1);
@@ -361,61 +349,51 @@ struct AssignNode final : ASTNode {
 
 /**
  * Interior: unary negation  -expr.
- *
  *     UnaryMinus
  *     └── operand  (sub-expression to negate)
  */
 struct UnaryMinusNode final : ASTNode {
     NodePtr operand;
-
     explicit UnaryMinusNode(NodePtr op)
         : ASTNode(NodeKind::UnaryMinus), operand(std::move(op)) {}
-
     [[nodiscard]] std::string dump(int depth) const override {
         return pad(depth) + "UnaryMinus\n" +
                operand->dump(depth + 1);
     }
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
+// =============================================================================
 //  §4  RECURSIVE-DESCENT PARSER
 //      Transforms a token stream into an AST.
-// ─────────────────────────────────────────────────────────────────────────────
+// =============================================================================
 
 /**
  * Parser — LL(2) recursive-descent parser.
  *
- * Each grammar non-terminal is implemented as a private method.  Operator
- * precedence is encoded structurally: higher-precedence operators are handled
- * by methods that are invoked DEEPER in the call chain, giving them tighter
- * binding naturally — no explicit Pratt table or precedence integer needed.
+ * Each grammar non-terminal is a private method.  Operator precedence is
+ * encoded structurally: higher-precedence operators are handled by methods
+ * invoked DEEPER in the call chain.
  *
- * Precedence table (low → high):
- * ┌────────────────┬──────────────────────────────────────────────────────┐
- * │ Non-terminal   │ Handles                                              │
- * ├────────────────┼──────────────────────────────────────────────────────┤
- * │ parseStatement │ = assignment (lowest; only at top level)             │
- * │ parseExpression│ + -                                                  │
- * │ parseTerm      │ * /                                                  │
- * │ parseUnary     │ unary -                                              │
- * │ parsePrimary   │ literals · identifiers · ( ) grouping   (highest)   │
- * └────────────────┴──────────────────────────────────────────────────────┘
+ * Precedence table (low -> high):
+ *   parseStatement  →  = assignment
+ *   parseExpression →  + -
+ *   parseTerm       →  * /
+ *   parseUnary      →  unary -
+ *   parsePrimary    →  literals · identifiers · ( ) grouping
  *
  * Complexity:
  *   Time  O(n)  — each token consumed at most once, no backtracking.
- *   Space O(d)  — implicit call stack = nesting depth d;
- *                 AST nodes themselves occupy O(n) heap space.
+ *   Space O(d)  — implicit call stack = nesting depth d.
+ *         O(n)  — AST nodes on the heap.
  */
 class Parser {
 public:
-    /// @param tokens  Fully materialised token list (including End sentinel).
     explicit Parser(std::vector<Token> tokens)
         : tokens_(std::move(tokens)), cursor_(0) {}
 
-    /// Parse the entire input and return the root of the AST.
     [[nodiscard]] NodePtr parseProgram() {
         NodePtr root = parseStatement();
-        expect(TokenKind::End); // ensures no trailing junk after the expression
+        expect(TokenKind::End);
         return root;
     }
 
@@ -423,29 +401,10 @@ private:
     std::vector<Token> tokens_;
     std::size_t        cursor_;
 
-    // ── Token-stream helpers ──────────────────────────────────────────────
-
-    /// Return the current token without consuming it.
-    [[nodiscard]] const Token& peek() const noexcept {
-        return tokens_[cursor_];
-    }
-
-    /**
-     * Return the token ONE position ahead without consuming either token.
-     *
-     * Safety invariant: the lexer always appends an End sentinel, so
-     * tokens_.size() >= 2 whenever peek() is not already the End sentinel.
-     * We only call peekNext() when peek().kind == Ident, which guarantees we
-     * are not at the last token, making tokens_[cursor_ + 1] always valid.
-     */
-    [[nodiscard]] const Token& peekNext() const noexcept {
-        return tokens_[cursor_ + 1];
-    }
-
-    /// Consume and return the current token.
+    [[nodiscard]] const Token& peek()     const noexcept { return tokens_[cursor_];     }
+    [[nodiscard]] const Token& peekNext() const noexcept { return tokens_[cursor_ + 1]; }
     const Token& advance() noexcept { return tokens_[cursor_++]; }
 
-    /// Consume the current token, throwing if its kind does not match expected.
     const Token& expect(TokenKind expected) {
         if (peek().kind != expected)
             throw std::runtime_error(
@@ -455,22 +414,17 @@ private:
         return advance();
     }
 
-    // ── Grammar rules ─────────────────────────────────────────────────────
-
     /**
-     * statement → IDENT '=' expression   (assignment)
-     *           | expression
+     * statement → IDENT '=' expression  |  expression
      *
-     * Uses 2-token lookahead:
-     *   If peek() == Ident AND peekNext() == '='  → assignment production.
-     *   Otherwise fall through to expression.
-     * Both checks are O(1) because the token array is pre-built.
+     * LL(2) lookahead: if the current token is IDENT and the NEXT is '=',
+     * take the assignment branch.  Otherwise fall into expression.
+     * Both peek() and peekNext() are O(1) array accesses.
      */
     NodePtr parseStatement() {
-        if (peek().kind    == TokenKind::Ident &&
+        if (peek().kind     == TokenKind::Ident &&
             peekNext().kind == TokenKind::Equals) {
-
-            std::string varName{ peek().lexeme }; // copy name before advancing
+            std::string varName{ peek().lexeme };
             advance(); // consume IDENT
             advance(); // consume '='
             NodePtr rhs = parseExpression();
@@ -481,10 +435,7 @@ private:
 
     /**
      * expression → term { ('+' | '-') term }
-     *
-     * Left-associative: a - b - c  ≡  (a - b) - c.
-     * The while-loop folds each successive term into the running node from the
-     * left, building a left-leaning binary tree.
+     * Left-associative: the while-loop folds left, building a left-leaning tree.
      */
     NodePtr parseExpression() {
         NodePtr node = parseTerm();
@@ -499,10 +450,7 @@ private:
 
     /**
      * term → unary { ('*' | '/') unary }
-     *
-     * Same structure as parseExpression but at higher precedence.
-     * Because parseTerm is called from parseExpression, multiplication and
-     * division naturally bind tighter than addition and subtraction.
+     * Higher precedence than expression by virtue of being called from it.
      */
     NodePtr parseTerm() {
         NodePtr node = parseUnary();
@@ -517,26 +465,19 @@ private:
 
     /**
      * unary → '-' unary | primary
-     *
-     * Right-recursive: ---x  parses as  -(-(-(x))).
-     * Each recursive call consumes one '-' and wraps its child in a
-     * UnaryMinusNode, building a right-leaning chain.
+     * Right-recursive: ---x parses as -(-(-(x))).
      */
     NodePtr parseUnary() {
         if (peek().kind == TokenKind::Minus) {
             advance();
-            return std::make_unique<UnaryMinusNode>(parseUnary()); // recurse
+            return std::make_unique<UnaryMinusNode>(parseUnary());
         }
         return parsePrimary();
     }
 
     /**
-     * primary → NUMBER
-     *         | IDENT
-     *         | '(' expression ')'
-     *
-     * This is the base case of the grammar; it handles the highest-precedence
-     * constructs.  Parentheses reset precedence by re-entering parseExpression.
+     * primary → NUMBER | IDENT | '(' expression ')'
+     * Base case; parentheses re-enter parseExpression resetting precedence.
      */
     NodePtr parsePrimary() {
         const Token& tok = peek();
@@ -545,80 +486,59 @@ private:
             advance();
             return std::make_unique<NumberNode>(tok.intVal);
         }
-
         if (tok.kind == TokenKind::Ident) {
             advance();
             return std::make_unique<VariableNode>(tok.lexeme);
         }
-
         if (tok.kind == TokenKind::LParen) {
-            advance();                     // consume '('
+            advance();
             NodePtr inner = parseExpression();
-            expect(TokenKind::RParen);     // consume ')' or throw
+            expect(TokenKind::RParen);
             return inner;
         }
 
-        // Nothing matched — the input is syntactically invalid.
         throw std::runtime_error(
             "Parser: unexpected token '" + std::string(tok.lexeme) +
             "' (kind: " + std::string(kindLabel(tok.kind)) + ")");
     }
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
+// =============================================================================
 //  §5  CODE GENERATOR
 //      Traverses the AST in post-order DFS and emits ARM-like pseudo-assembly.
-// ─────────────────────────────────────────────────────────────────────────────
+// =============================================================================
 
 /**
- * CodeGenerator — AST → ARM Pseudo-Assembly via post-order depth-first search.
+ * CodeGenerator — AST -> ARM Pseudo-Assembly via post-order depth-first search.
  *
- * ── Virtual Register Model ───────────────────────────────────────────────────
- *   Registers are named R0, R1, R2, …   (Static Single-Assignment style:
- *   each register is written exactly once, then only read.)
- *   `regCounter_` is the index of the next free register.
- *   Each emit*() function returns the register index that holds its result.
+ * Virtual Register Model (SSA-style):
+ *   Registers R0, R1, R2, ... — each written exactly once, then only read.
+ *   regCounter_ tracks the next free index.
+ *   Each emit*() returns the register index holding its result.
  *
- * ── Instruction Set (ARM Cortex-M / PIC-inspired) ───────────────────────────
+ * Instruction Set (ARM Cortex-M / PIC-inspired):
+ *   LDR  Rd, #imm     Rd <- immediate constant
+ *   LDR  Rd, [var]    Rd <- memory[var]
+ *   STR  Rs, [var]    memory[var] <- Rs
+ *   NEG  Rd, Rm       Rd <- 0 - Rm  (unary negate)
+ *   ADD  Rd, Ra, Rb   Rd <- Ra + Rb
+ *   SUB  Rd, Ra, Rb   Rd <- Ra - Rb
+ *   MUL  Rd, Ra, Rb   Rd <- Ra * Rb
+ *   SDIV Rd, Ra, Rb   Rd <- Ra / Rb  (signed integer divide)
  *
- *   Instruction          Semantics
- *   ─────────────────── ──────────────────────────────────────────────────
- *   LDR  Rd, #imm        Rd ← immediate integer constant
- *   LDR  Rd, [var]       Rd ← memory[var]   (load variable)
- *   STR  Rs, [var]       memory[var] ← Rs   (store variable)
- *   NEG  Rd, Rm          Rd ← 0 − Rm        (unary negate)
- *   ADD  Rd, Ra, Rb      Rd ← Ra + Rb
- *   SUB  Rd, Ra, Rb      Rd ← Ra − Rb
- *   MUL  Rd, Ra, Rb      Rd ← Ra × Rb
- *   SDIV Rd, Ra, Rb      Rd ← Ra ÷ Rb       (signed integer divide)
- *
- * ── Why Post-Order? ──────────────────────────────────────────────────────────
- *   In post-order DFS, a node is "processed" AFTER BOTH its subtrees.
- *   For a BinaryOpNode this means:
- *     1. Emit all code for the left sub-expression  → result in Ra
- *     2. Emit all code for the right sub-expression → result in Rb
- *     3. Emit the combining instruction              → result in Rc
- *   This is the natural topological order of a DAG: every operand instruction
- *   is guaranteed to appear BEFORE the instruction that consumes it.
- *
- * ── Complexity ───────────────────────────────────────────────────────────────
- *   Time  O(n)  — each node visited exactly once.
- *   Space O(n)  — one register allocated per node (leaf or interior).
- *         O(d)  — recursive call stack (d = tree depth, as in the parser).
+ * Why post-order?
+ *   The parent instruction is always emitted AFTER both operand sub-trees,
+ *   guaranteeing every instruction's inputs are produced before it runs —
+ *   the topological ordering required by any sequential instruction stream.
  */
 class CodeGenerator {
 public:
-    /**
-     * Run code generation over the given AST and return the assembly listing.
-     * @param root  Non-owning raw pointer; the generator does not take ownership.
-     */
     [[nodiscard]] std::string generate(const ASTNode* root) {
         regCounter_ = 0;
         listing_.clear();
-
-        comment("──── begin codegen  (post-order DFS) ────");
+        comment("---- begin codegen  (post-order DFS) ----");
         const int resultReg = emitNode(root);
-        comment("──── result in " + regName(resultReg) + " ────");
+        comment("---- result in " + regName(resultReg) + " ----");
         return listing_;
     }
 
@@ -626,38 +546,19 @@ private:
     int         regCounter_{0};
     std::string listing_;
 
-    // ── Register allocation ───────────────────────────────────────────────
-
-    /// Allocate and return the next free virtual register index.
-    int allocReg() noexcept { return regCounter_++; }
-
-    /// Format a register index as its ARM name, e.g.  3 → "R3".
+    int  allocReg() noexcept { return regCounter_++; }
     static std::string regName(int r) { return 'R' + std::to_string(r); }
 
-    // ── Emission helpers ──────────────────────────────────────────────────
-
-    /// Append one assembly instruction (4-space indented).
     void instr(const std::string& text) {
-        listing_ += "    ";
-        listing_ += text;
-        listing_ += '\n';
+        listing_ += "    "; listing_ += text; listing_ += '\n';
     }
-
-    /// Append one inline comment (2-space + "; " prefix).
     void comment(const std::string& text) {
-        listing_ += "  ; ";
-        listing_ += text;
-        listing_ += '\n';
+        listing_ += "  ; "; listing_ += text; listing_ += '\n';
     }
-
-    // ── Post-Order DFS dispatch ───────────────────────────────────────────
 
     /**
-     * Central dispatch: switch on node->kind and static_cast to the correct
-     * concrete type.  This avoids RTTI / dynamic_cast overhead and mirrors
-     * the approach used in Clang (Stmt::getStmtClass) and LLVM (Value::getValueID).
-     *
-     * @return The register index in which the node's result resides.
+     * Central dispatch via NodeKind tag + static_cast.
+     * Avoids RTTI / dynamic_cast overhead — same pattern as Clang and LLVM.
      */
     int emitNode(const ASTNode* node) {
         switch (node->kind) {
@@ -672,29 +573,15 @@ private:
             case NodeKind::UnaryMinus:
                 return emitUnaryMinus(static_cast<const UnaryMinusNode*>(node));
         }
-        // Unreachable if NodeKind enum is exhaustive, but satisfies -Wreturn-type.
         throw std::logic_error("CodeGen: unhandled NodeKind in emitNode()");
     }
 
-    // ── Per-node emitters ─────────────────────────────────────────────────
-
-    /**
-     * NumberNode  →  LDR Rd, #value
-     *
-     * Allocate a fresh register and load the immediate constant into it.
-     */
     int emitNumber(const NumberNode* n) {
         const int rd = allocReg();
         instr("LDR  " + regName(rd) + ", #" + std::to_string(n->value));
         return rd;
     }
 
-    /**
-     * VariableNode  →  LDR Rd, [name]
-     *
-     * Allocate a fresh register and load the variable's value from its
-     * memory-mapped label.
-     */
     int emitVariable(const VariableNode* n) {
         const int rd = allocReg();
         instr("LDR  " + regName(rd) + ", [" + n->name + ']');
@@ -702,30 +589,18 @@ private:
     }
 
     /**
-     * BinaryOpNode  —  the heart of the post-order DFS.
-     *
-     * Post-order sequence for  (lhs OP rhs):
-     *
-     *   Phase 1 [recurse left] :  emit all instructions for lhs  → Ra
-     *   Phase 2 [recurse right]:  emit all instructions for rhs  → Rb
-     *   Phase 3 [process self] :  emit  OP  Rc, Ra, Rb           → Rc
-     *
-     * This ensures every instruction for an operand physically precedes the
-     * instruction that USES that operand — the correct dependency order.
+     * Post-order for BinaryOpNode:
+     *   Phase 1: recurse lhs  → Ra   (all lhs instructions come first)
+     *   Phase 2: recurse rhs  → Rb   (all rhs instructions come next)
+     *   Phase 3: emit OP Rc, Ra, Rb  (parent always last)
      */
     int emitBinaryOp(const BinaryOpNode* n) {
-        // Phase 1: evaluate left sub-tree first.
         comment(std::string("eval LHS of '") + n->op + '\'');
         const int ra = emitNode(n->lhs.get());
-
-        // Phase 2: evaluate right sub-tree.
         comment(std::string("eval RHS of '") + n->op + '\'');
         const int rb = emitNode(n->rhs.get());
-
-        // Phase 3: combine with the binary operator.
         const int rd = allocReg();
 
-        // Choose the ARM mnemonic corresponding to the operator character.
         const char* mnem = nullptr;
         switch (n->op) {
             case '+': mnem = "ADD "; break;
@@ -736,32 +611,19 @@ private:
                 throw std::logic_error(
                     std::string("CodeGen: unknown operator '") + n->op + '\'');
         }
-
         instr(std::string(mnem) + ' ' +
               regName(rd) + ", " + regName(ra) + ", " + regName(rb));
         return rd;
     }
 
-    /**
-     * AssignNode  →  [emit RHS]  then  STR Rs, [var]
-     *
-     * 1. Generate all instructions to evaluate the RHS expression → Rs.
-     * 2. STR stores Rs into the variable's memory-mapped location.
-     */
     int emitAssign(const AssignNode* n) {
-        comment("evaluating RHS for assignment → [" + n->name + ']');
+        comment("evaluating RHS for assignment -> [" + n->name + ']');
         const int rs = emitNode(n->rhs.get());
         instr("STR  " + regName(rs) + ", [" + n->name + ']');
         comment("[" + n->name + "] written");
-        return rs; // return the result register in case it is used further
+        return rs;
     }
 
-    /**
-     * UnaryMinusNode  →  [emit operand]  then  NEG Rd, Ra
-     *
-     * 1. Recursively emit the operand expression → Ra.
-     * 2. NEG Rd, Ra  computes  Rd = 0 − Ra  (two's-complement negation).
-     */
     int emitUnaryMinus(const UnaryMinusNode* n) {
         comment("eval operand of unary '-'");
         const int ra = emitNode(n->operand.get());
@@ -771,18 +633,44 @@ private:
     }
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  §6  DRIVER — wires the three stages together
-// ─────────────────────────────────────────────────────────────────────────────
+// =============================================================================
+//  §6  UTILITIES
+// =============================================================================
 
 /**
- * compile() — run the full Lex → Parse → CodeGen pipeline on one source string
- * and print the intermediate representation of each stage to stdout.
+ * trimmed() — strip leading and trailing whitespace (including '\r') from sv.
  *
- * @param source  A single mathematical expression or assignment statement.
+ * Why this matters for REPL robustness:
+ *   1. Trailing spaces cause the parser's End-sentinel check to fail with a
+ *      confusing "unexpected token" error instead of clean EOF.
+ *   2. '\r' appears when input is pasted from Windows-formatted text
+ *      (CRLF line endings) on a Unix terminal.
+ *
+ * Returns a string_view window into the same buffer — zero allocation.
+ */
+static std::string_view trimmed(std::string_view sv) noexcept {
+    while (!sv.empty() && std::isspace(static_cast<unsigned char>(sv.front())))
+        sv.remove_prefix(1);
+    while (!sv.empty() && std::isspace(static_cast<unsigned char>(sv.back())))
+        sv.remove_suffix(1);
+    return sv;
+}
+
+// =============================================================================
+//  §7  DRIVER — wires the three stages together
+// =============================================================================
+
+/**
+ * compile() — run the full Lex -> Parse -> CodeGen pipeline on one source line.
+ *
+ * stdout carries the assembly listing.
+ * stderr carries prompts and error messages.
+ *
+ * Keeping them separate means the user can redirect stdout to capture a clean
+ * assembly file without REPL chrome:
+ *   ./compiler > out.asm
  */
 static void compile(std::string_view source) {
-    // ── Header ───────────────────────────────────────────────────────────────
     const std::string divider(56, '=');
     std::cout << '\n' << divider << '\n';
     std::cout << "  SOURCE:  " << source << '\n';
@@ -793,7 +681,7 @@ static void compile(std::string_view source) {
         Lexer              lexer(source);
         std::vector<Token> tokens = lexer.tokenize();
 
-        std::cout << "\n[Stage 1 — Token Stream]\n";
+        std::cout << "\n[Stage 1 - Token Stream]\n";
         for (const auto& tok : tokens) {
             std::cout << "    " << kindLabel(tok.kind);
             if (tok.kind == TokenKind::Number)
@@ -807,44 +695,76 @@ static void compile(std::string_view source) {
         Parser  parser(std::move(tokens));
         NodePtr ast = parser.parseProgram();
 
-        std::cout << "\n[Stage 2 — Abstract Syntax Tree]\n";
-        std::cout << ast->dump(1) << '\n'; // dump() is called on the root
+        std::cout << "\n[Stage 2 - Abstract Syntax Tree]\n";
+        std::cout << ast->dump(1) << '\n';
 
         // ── Stage 3: Code Generation ──────────────────────────────────────────
         CodeGenerator codegen;
         std::string   listing = codegen.generate(ast.get());
 
-        std::cout << "\n[Stage 3 — ARM Pseudo-Assembly]\n";
+        std::cout << "\n[Stage 3 - ARM Pseudo-Assembly]\n";
         std::cout << listing;
 
-        // `ast` goes out of scope here → unique_ptr cascade-deletes the entire
-        // AST tree bottom-up via the virtual destructor chain.  Zero leaks.
+        // `ast` falls out of scope -> unique_ptr cascade-deletes the entire tree
+        // via the virtual destructor chain.  O(n) destruction, zero leaks.
 
     } catch (const std::exception& ex) {
         std::cerr << "  [COMPILE ERROR]  " << ex.what() << '\n';
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  §7  MAIN — four increasingly complex test cases
-// ─────────────────────────────────────────────────────────────────────────────
+// =============================================================================
+//  §8  MAIN — Interactive REPL
+// =============================================================================
+
+/// Print the startup banner once on launch.
+static void printBanner() {
+    std::cout
+        << "============================================================\n"
+        << "  Math-to-Assembly Toy Compiler Front-End\n"
+        << "  Standard  : C++17  |  Target: ARM Pseudo-Assembly\n"
+        << "  Commands  : 'help' for examples  |  'exit' / 'quit' to stop\n"
+        << "  Tip       : stdout = assembly listing (safe to redirect)\n"
+        << "              prompts and errors go to stderr\n"
+        << "============================================================\n";
+}
+
+/// Show four example expressions that cover every language feature.
+static void printHelp() {
+    std::cout
+        << "\n  Example expressions:\n"
+        << "    3 + 5                          basic arithmetic\n"
+        << "    x = 5 + 3 * 8                 assignment + precedence\n"
+        << "    result = (a + b) * (a - b)     variables + grouping\n"
+        << "    y = -(x + 2) * 4 / (z - 1)    unary minus + all operators\n\n";
+}
 
 int main() {
-    std::cout << "============================================================\n";
-    std::cout << "  Math-to-Assembly Toy Compiler\n";
-    std::cout << "  Type an equation (e.g., x = 5 + 3 * 8) or type 'exit' to quit.\n";
-    std::cout << "============================================================\n";
+    printBanner();
 
     std::string input;
-    while (true) {
-        std::cout << "\n>> ";
-        if (!std::getline(std::cin, input)) break;
-        if (input == "exit" || input == "quit") break;
-        if (input.empty()) continue;
 
-        compile(input);
+    while (true) {
+        // Prompt to stderr — does not appear in redirected stdout.
+        std::cerr << "\n>> ";
+
+        // getline() returns false on EOF (Ctrl+D on Linux, Ctrl+Z on Windows).
+        if (!std::getline(std::cin, input)) break;
+
+        // C++17 if-with-initialiser: `expr` is scoped to this block only.
+        // trimmed() strips whitespace and '\r' before any further processing.
+        if (const auto expr = trimmed(input); expr.empty()) {
+            continue;                          // blank line — prompt again
+        } else if (expr == "exit" || expr == "quit") {
+            break;
+        } else if (expr == "help") {
+            printHelp();
+        } else {
+            compile(expr);                     // run the full pipeline
+        }
     }
 
+    std::cerr << "\n  Goodbye.\n";
     return 0;
 }
 
@@ -854,11 +774,11 @@ int main() {
  * =============================================================================
  *
  *  Input size:  n = number of tokens produced by the lexer
- *               (also proportional to the number of characters in the source).
+ *               (proportional to the number of characters in the source).
  *
  *  ── Lexer ────────────────────────────────────────────────────────────────
  *  Time  O(n)   — one character at a time, no look-back.
- *  Space O(k)   — k tokens stored in the output vector; k ≤ n.
+ *  Space O(k)   — k tokens stored in the output vector; k <= n.
  *                  No source copying (string_view windows).
  *
  *  ── Parser ───────────────────────────────────────────────────────────────
@@ -872,12 +792,11 @@ int main() {
  *    grammar runs in O(n) steps.
  *
  *  Space O(n) heap (AST nodes) + O(d) stack (recursion depth):
- *    • The AST has exactly one node per leaf (literal / identifier) and one
- *      per operator, so the node count ≤ 2n − 1 = O(n).
- *    • The recursive call stack depth equals the expression's nesting depth d.
- *      Worst case: a fully right-associative expression like  a+(b+(c+(d+…)))
- *      or a heavily parenthesised one like  ((((x))))  gives d = O(n).
- *      Balanced, typical expressions give d = O(log n).
+ *    The AST has exactly one node per leaf (literal / identifier) and one
+ *    per operator, so the node count <= 2n - 1 = O(n).
+ *    The recursive call stack depth equals the expression's nesting depth d.
+ *    Worst case: ((((x)))) gives d = O(n).
+ *    Balanced, typical expressions give d = O(log n).
  *
  *  ── Code Generator ───────────────────────────────────────────────────────
  *  Time  O(n)   — each AST node visited once in the DFS.
